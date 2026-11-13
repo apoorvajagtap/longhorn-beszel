@@ -5,8 +5,12 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/henrygd/beszel/internal/entities/smart"
@@ -424,6 +428,20 @@ func TestMergeDeviceListsPreservesVerification(t *testing.T) {
 	assert.Equal(t, "sat+megaraid", device.Type)
 }
 
+func TestMergeDeviceListsResetsSmartUnsupported(t *testing.T) {
+	existing := []*DeviceInfo{{Name: "/dev/sdd", smartUnsupported: true}}
+	scanned := []*DeviceInfo{{Name: "/dev/sdd", Type: "scsi"}}
+
+	merged := mergeDeviceLists(existing, scanned, nil)
+	require.Len(t, merged, 1)
+	assert.False(t, merged[0].smartUnsupported, "rescan must reset the flag so the device is re-probed")
+
+	// Empty/failed scan returns the existing list: flag kept, no extra probes.
+	merged = mergeDeviceLists(existing, nil, nil)
+	require.Len(t, merged, 1)
+	assert.True(t, merged[0].smartUnsupported, "empty scan must keep the flag")
+}
+
 func TestMergeDeviceListsUpdatesTypeWhenUnverified(t *testing.T) {
 	existing := []*DeviceInfo{
 		{Name: "/dev/sda", Type: "sat", parserType: "sat", typeVerified: false},
@@ -779,4 +797,63 @@ func TestFilterExcludedDevices(t *testing.T) {
 			assert.Equal(t, tt.expectedDevs, result)
 		})
 	}
+}
+
+// newExit2Smartctl writes a fake smartctl that records each invocation and exits 2.
+// It returns the binary path and a func reporting how many times it was invoked.
+func newExit2Smartctl(t *testing.T) (string, func() int) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script as smartctl")
+	}
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	bin := filepath.Join(dir, "smartctl")
+	require.NoError(t, os.WriteFile(bin,
+		fmt.Appendf(nil, "#!/bin/sh\necho x >> %q\nexit 2\n", calls), 0o755))
+
+	countCalls := func() int {
+		out, err := os.ReadFile(calls)
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		require.NoError(t, err)
+		return strings.Count(string(out), "x")
+	}
+	return bin, countCalls
+}
+
+func TestCollectSmart_ExitStatus2MarksUnsupported(t *testing.T) {
+	bin, countCalls := newExit2Smartctl(t)
+	sm := &SmartManager{SmartDataMap: map[string]*smart.SmartData{}, binPath: bin}
+	dev := &DeviceInfo{Name: "/dev/sdd"}
+
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, sm.CollectSmart(dev), &exitErr)
+	assert.True(t, dev.smartUnsupported)
+	assert.Equal(t, 2, countCalls(), "call with -n standby + retry without it")
+
+	assert.ErrorIs(t, sm.CollectSmart(dev), errNoValidSmartData)
+	assert.Equal(t, 2, countCalls(), "skipped while marked unsupported")
+
+	// Simulate a rescan: the merged copy is unflagged, so it's probed again.
+	dev = mergeDeviceLists([]*DeviceInfo{dev}, []*DeviceInfo{{Name: "/dev/sdd"}}, nil)[0]
+	require.False(t, dev.smartUnsupported)
+	require.ErrorAs(t, sm.CollectSmart(dev), &exitErr)
+	assert.True(t, dev.smartUnsupported)
+	assert.Equal(t, 4, countCalls(), "re-probed after rescan")
+}
+
+func TestCollectSmart_StandbyWithCacheNotMarked(t *testing.T) {
+	bin, countCalls := newExit2Smartctl(t)
+	sm := &SmartManager{
+		SmartDataMap: map[string]*smart.SmartData{"serial-1": {DiskName: "/dev/sdd"}},
+		binPath:      bin,
+	}
+	dev := &DeviceInfo{Name: "/dev/sdd"}
+
+	// Exit 2 with -n standby and cached data: device is asleep, keep the cache.
+	assert.NoError(t, sm.CollectSmart(dev))
+	assert.False(t, dev.smartUnsupported)
+	assert.Equal(t, 1, countCalls(), "no retry without -n standby when cache exists")
 }

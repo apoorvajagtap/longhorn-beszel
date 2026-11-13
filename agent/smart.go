@@ -51,6 +51,13 @@ type DeviceInfo struct {
 	typeVerified bool
 	// parserType holds the parser type (nvme, sat, scsi) that last succeeded.
 	parserType string
+	// smartUnsupported is set when smartctl still exits 2 after the retry without
+	// -n standby: the device isn't asleep but couldn't be opened or identified
+	// (e.g. Hyper-V/WSL2 virtual disks, longhorn/longhorn#13632). Exit 2 can also
+	// be a transient open failure, so this is in-memory only: mergeDeviceLists
+	// deliberately does not carry it over, and each rescan (at most every 30 min)
+	// re-probes the device once.
+	smartUnsupported bool
 }
 
 var errNoValidSmartData = fmt.Errorf("no valid SMART data found") // Error for missing data
@@ -436,7 +443,7 @@ func (sm *SmartManager) parseSmartOutput(deviceInfo *DeviceInfo, output []byte) 
 // Uses -n standby to avoid waking up sleeping disks, but bypasses standby mode
 // for initial data collection when no cached data exists
 func (sm *SmartManager) CollectSmart(deviceInfo *DeviceInfo) error {
-	if deviceInfo != nil && sm.isExcludedDevice(deviceInfo.Name) {
+	if deviceInfo == nil || deviceInfo.smartUnsupported || sm.isExcludedDevice(deviceInfo.Name) {
 		return errNoValidSmartData
 	}
 
@@ -470,8 +477,16 @@ func (sm *SmartManager) CollectSmart(deviceInfo *DeviceInfo) error {
 	hasValidData := sm.parseSmartOutput(deviceInfo, output)
 
 	if !hasValidData {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
+			// Devices that still exit 2 without -n standby are marked smartUnsupported and
+			// skipped (returning errNoValidSmartData) until the next rescan.
+			deviceInfo.smartUnsupported = true
+			slog.Debug("SMART not supported, skipping device until next rescan", "device", deviceInfo.Name, "err", err)
+			return err
+		}
 		if err != nil {
-			slog.Info("smartctl failed", "device", deviceInfo.Name, "err", err)
+			slog.Warn("smartctl failed", "device", deviceInfo.Name, "err", err)
 			return err
 		}
 		slog.Info("no valid SMART data found", "device", deviceInfo.Name)
